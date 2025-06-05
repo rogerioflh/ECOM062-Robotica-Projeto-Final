@@ -1,253 +1,265 @@
-import build as sim # CoppeliaSim remote API client
+import sim # CoppeliaSim remote API client
+# import simConst # simConstants are usually available under sim.simx_opmode_blocking, etc.
 import time
 import math
-import numpy as np # For potential future kinematic calculations
 
 # --- Simulation Configuration ---
 COPPELIASIM_IP = '127.0.0.1'
-COPPELIASIM_PORT = 19997 # Default port, use 19999 for non-blocking
+COPPELIASIM_PORT = 19997 # Default port
 
-# --- Robot and Gripper Configuration ---
-# !!! IMPORTANT: Replace these with the actual names from your CoppeliaSim scene !!!
+# --- Robot and Gripper Configuration (VERIFIQUE E AJUSTE ESTES VALORES!) ---
+# Nomes das juntas do robô (confirmado pela hierarquia da cena)
 ROBOT_JOINT_NAMES = [
     'joint1', 'joint2', 'joint3',
     'joint4', 'joint5', 'joint6'
 ]
-# For Robotiq 2F-85, often one joint controls the synchronized finger movement.
-# Or, you might have a script function in CoppeliaSim to control it.
-# This example assumes a simple joint control for the gripper.
-GRIPPER_JOINT_NAME = 'Revolute_joint' # Example name
-GRIPPER_OPEN_POS_DEG = 0    # Gripper joint angle for open state (degrees)
-GRIPPER_CLOSED_POS_DEG = 35 # Gripper joint angle for closed state (degrees)
+# Nome da junta da garra (identificado na hierarquia da cena como 'Revolute_joint' sob 'end_effector')
+GRIPPER_JOINT_NAME = 'Revolute_joint'
+# !!! IMPORTANTE: Determine estes ângulos manualmente no CoppeliaSim !!!
+# Mova 'Revolute_joint' para encontrar os valores corretos para abrir/fechar a garra.
+GRIPPER_OPEN_POS_DEG = 0    # Ângulo da junta da garra para estado aberto (graus) - AJUSTE ESTE VALOR
+GRIPPER_CLOSED_POS_DEG = 35 # Ângulo da junta da garra para estado fechado (graus) - AJUSTE ESTE VALOR (para segurar 'goal')
 
-TARGET_OBJECT_NAME = 'goal' # Name of the object to pick
-GRIPPER_TCP_NAME = 'robotiq_gripper' # Name of the Tool Center Point dummy/object
+# Nome do objeto alvo (identificado nas propriedades do objeto como 'goal')
+TARGET_OBJECT_NAME = 'goal'
+# Nome do TCP (Tool Center Point - Ponto Central da Ferramenta)
+# Usando 'end_effector' que é um dummy na ponta do robô, conforme hierarquia.
+GRIPPER_TCP_NAME = 'end_effector'
 
 # --- Predefined Robot Configurations (Joint Angles in Degrees) ---
-# These would typically be found using Inverse Kinematics from desired Cartesian poses.
-# Values are illustrative and NEED to be adjusted for your specific setup and task.
-Q_REST = [0, 30, 60, 0, -90, 0] # Ponto A: Repouso
+# !!! CRÍTICO: Estes valores de Q (ângulos das juntas) SÃO ILUSTRATIVOS e DEVEM SER AJUSTADOS
+# para o seu robô específico, a posição do objeto 'goal' (x:0.625, y:0.050, z:0.200 conforme imagem),
+# e os locais desejados para pegar e soltar.
+# Use o CoppeliaSim para encontrar estes ângulos movendo o robô manualmente.
 
-# Ponto B (Pegar Objeto - frente, na linha do braço estendido)
-# These Q values assume the object is directly in front at a certain height and extension
-Q_APPROACH_PICK = [0, 30, 60, 0, -90, 0]  # Approach above object
-Q_GRASP_OBJECT = [0, 45, 75, 0, -75, 0]   # Grasping position
+# Ponto A: Repouso (Exemplo: uma posição inicial segura)
+Q_REST = [0, 0, 0, 0, 0, 0] # AJUSTE ESTE VALOR
 
-# Ponto C (Retornar para trás com objeto) - Could be same as Q_APPROACH_PICK or slightly higher
-Q_RETREAT_BACK = [0, 30, 60, 0, -90, 0]
+# Ponto B (Pegar Objeto - 'goal' em x:0.625, y:0.050, z:0.200)
+# Estes Qs devem levar o 'end_effector' (TCP) até o objeto 'goal'.
+Q_APPROACH_PICK = [0, 15, 45, 0, -60, 0]  # AJUSTE: Aproximação acima do 'goal'
+Q_GRASP_OBJECT = [0, 25, 55, 0, -70, 0]   # AJUSTE: Posição de agarre para o 'goal'
 
-# Ponto D (Rotacionar base à direita com objeto)
-# Assuming alpha = 90 degrees for rotation to the right. Adjust as needed.
-ALPHA_ROTATION_DEG = -90 # Negative for right-hand rotation around Z-axis for many robots
-Q_ROTATE_BASE = [ALPHA_ROTATION_DEG, 30, 60, 0, -90, 0] # q1 changed, others from Q_RETREAT_BACK
+# Ponto C (Recuar/subir com o objeto após pegar)
+Q_RETREAT_AFTER_PICK = [0, 15, 45, 0, -60, 0] # AJUSTE: Mover para cima/trás após pegar
 
-# Ponto E (Avançar e soltar o objeto) - Similar to Q_GRASP_OBJECT but with rotated base
-Q_APPROACH_RELEASE = [ALPHA_ROTATION_DEG, 30, 60, 0, -90, 0] # Approach above drop-off
-Q_RELEASE_OBJECT = [ALPHA_ROTATION_DEG, 45, 75, 0, -75, 0] # Release position
+# Ponto D (Local de Soltar - Exemplo: Rotacionar a base e mover para um novo local)
+# Defina uma rotação para q1 se necessário, ex: ALPHA_ROTATION_DEG = 90
+Q_APPROACH_RELEASE = [-90, 15, 45, 0, -60, 0] # AJUSTE: Aproximação acima do ponto de soltar
+Q_RELEASE_OBJECT = [-90, 25, 55, 0, -70, 0]   # AJUSTE: Posição para soltar
+
+# Ponto E (Recuar para uma posição segura ou repouso após soltar)
+Q_POST_RELEASE_RETREAT = [-90, 0, 0, 0, 0, 0] # AJUSTE
 
 # --- Helper Functions ---
 
 def connect_to_coppeliasim():
-    """Establishes connection with CoppeliaSim."""
-    sim.simxFinish(-1) # Just in case, close all opened connections
+    """Estabelece conexão com CoppeliaSim."""
+    sim.simxFinish(-1) # Fecha todas as conexões abertas, por precaução
     client_id = sim.simxStart(COPPELIASIM_IP, COPPELIASIM_PORT, True, True, 5000, 5)
     if client_id != -1:
-        print("Connected to CoppeliaSim")
+        print("Conectado ao CoppeliaSim")
     else:
-        print("Failed to connect to CoppeliaSim")
+        print("Falha ao conectar ao CoppeliaSim. Verifique se o CoppeliaSim está rodando e o servidor da API remota está iniciado.")
         exit()
     return client_id
 
 def get_object_handles(client_id):
-    """Gets handles for robot joints, gripper, and target object."""
+    """Obtém handles para as juntas do robô, garra, objeto alvo e TCP."""
     handles = {'joints': [], 'gripper_joint': None, 'target_object': None, 'tcp': None}
+    print("Obtendo handles dos objetos...")
     for name in ROBOT_JOINT_NAMES:
         err_code, handle = sim.simxGetObjectHandle(client_id, name, sim.simx_opmode_blocking)
         if err_code == sim.simx_return_ok:
             handles['joints'].append(handle)
+            # print(f"  Handle obtido para junta: {name}")
         else:
-            print(f"Error getting handle for joint: {name}")
+            print(f"  Erro ao obter handle para junta {name}: {err_code}")
             return None
-    
+
     err_code, handles['gripper_joint'] = sim.simxGetObjectHandle(client_id, GRIPPER_JOINT_NAME, sim.simx_opmode_blocking)
-    if err_code != sim.simx_return_ok:
-        print(f"Error getting handle for gripper joint: {GRIPPER_JOINT_NAME}")
-        # return None # Gripper might be optional for some tests
+    if err_code == sim.simx_return_ok:
+        # print(f"  Handle obtido para junta da garra: {GRIPPER_JOINT_NAME}")
+        pass
+    else:
+        print(f"  Erro ao obter handle para junta da garra {GRIPPER_JOINT_NAME}: {err_code}")
+        return None
 
     err_code, handles['target_object'] = sim.simxGetObjectHandle(client_id, TARGET_OBJECT_NAME, sim.simx_opmode_blocking)
-    if err_code != sim.simx_return_ok:
-        print(f"Error getting handle for target object: {TARGET_OBJECT_NAME}")
-        # return None
+    if err_code == sim.simx_return_ok:
+        # print(f"  Handle obtido para objeto alvo: {TARGET_OBJECT_NAME}")
+        pass
+    else:
+        print(f"  Erro ao obter handle para objeto alvo {TARGET_OBJECT_NAME}: {err_code}")
+        return None
 
     err_code, handles['tcp'] = sim.simxGetObjectHandle(client_id, GRIPPER_TCP_NAME, sim.simx_opmode_blocking)
-    if err_code != sim.simx_return_ok:
-        print(f"Error getting handle for TCP: {GRIPPER_TCP_NAME}")
-        # return None
+    if err_code == sim.simx_return_ok:
+        # print(f"  Handle obtido para TCP: {GRIPPER_TCP_NAME}")
+        pass
+    else:
+        print(f"  Erro ao obter handle para TCP {GRIPPER_TCP_NAME}: {err_code}. Verifique o nome.")
+        return None
         
+    if len(handles['joints']) != len(ROBOT_JOINT_NAMES):
+        print("Não foi possível obter todos os handles das juntas do robô.")
+        return None
+    print("Todos os handles necessários foram obtidos.")
     return handles
 
-def set_joint_target_positions(client_id, joint_handles, target_q_deg, speed_factor=0.5):
-    """Sets target positions for multiple joints and waits until movement is likely complete."""
-    print(f"Moving to: {target_q_deg}")
-    current_q_deg = []
-
-    # Set max velocity (optional, for smoother movement)
-    # for handle in joint_handles:
-    #     sim.simxSetObjectFloatParameter(client_id, handle, sim.sim_jointfloatparam_max_velocity, speed_factor * math.pi/4, sim.simx_opmode_oneshot)
-
+def set_joint_target_positions(client_id, joint_handles, target_q_deg, wait_time=2.5):
+    """Define as posições alvo para múltiplas juntas e espera um tempo fixo."""
+    print(f"Movendo para configuração de juntas (graus): {target_q_deg}")
     for i, handle in enumerate(joint_handles):
         target_rad = math.radians(target_q_deg[i])
         sim.simxSetJointTargetPosition(client_id, handle, target_rad, sim.simx_opmode_oneshot)
 
-    # Wait for movement to complete (simple heuristic)
-    # A more robust way would involve checking if joints have reached target
-    time.sleep(0.5) # Initial delay for movement to start
-    while True:
-        all_settled = True
-        current_q_rad_temp = []
-        for i, handle in enumerate(joint_handles):
-            err_code, q_rad = sim.simxGetJointPosition(client_id, handle, sim.simx_opmode_buffer) # Use _buffer or _streaming appropriately
-            if err_code == sim.simx_return_ok:
-                current_q_rad_temp.append(q_rad)
-                if abs(q_rad - math.radians(target_q_deg[i])) > math.radians(2): # Tolerance of 2 degrees
-                    all_settled = False
-            else:
-                # print(f"Warning: Could not read joint {i} position.")
-                all_settled = False # Assume not settled if can't read
-                break 
-        
-        if not current_q_rad_temp and len(joint_handles)>0 : # if list is empty, means first calls to getJointPosition haven't returned yet
-             sim.simxGetPingTime(client_id) # Ensure commands are processed
-             for i, handle in enumerate(joint_handles): # Start streaming if not already
-                 sim.simxGetJointPosition(client_id, handle, sim.simx_opmode_streaming)
-             time.sleep(0.1)
-             continue
+    # Espera simples para o movimento. Para movimentos mais robustos,
+    # seria ideal verificar se as juntas atingiram o alvo.
+    time.sleep(wait_time) # Ajuste wait_time conforme a velocidade do robô e distância.
+    # print("Movimento (presumidamente) completo.")
 
-
-        if all_settled:
-            # print("Movement likely complete.")
-            break
-        time.sleep(0.1) # Check interval
-    print("Movement complete.")
-
-
-def control_gripper(client_id, gripper_joint_handle, action, open_pos_deg, closed_pos_deg):
-    """Controls the gripper to open or close."""
-    if gripper_joint_handle is None:
-        print("Gripper not available.")
-        return
-
+def control_gripper(client_id, gripper_joint_handle, action, open_pos_deg, closed_pos_deg, wait_time=1.5):
+    """Controla a garra para abrir ou fechar."""
+    target_pos_rad = 0
     if action == "open":
         target_pos_rad = math.radians(open_pos_deg)
-        print("Opening gripper...")
+        print(f"Abrindo garra para {open_pos_deg} graus.")
     elif action == "close":
         target_pos_rad = math.radians(closed_pos_deg)
-        print("Closing gripper...")
+        print(f"Fechando garra para {closed_pos_deg} graus.")
     else:
-        print(f"Invalid gripper action: {action}")
+        print(f"Ação inválida para garra: {action}")
         return
 
     sim.simxSetJointTargetPosition(client_id, gripper_joint_handle, target_pos_rad, sim.simx_opmode_oneshot)
-    time.sleep(1.0) # Allow time for gripper to actuate
-    print(f"Gripper action '{action}' complete.")
+    time.sleep(wait_time) # Espera pela ação da garra
+    # print(f"Ação da garra '{action}' completa.")
+
 
 def attach_object_to_gripper(client_id, tcp_handle, object_handle):
-    """Attaches the object to the gripper's TCP (kinematically)."""
-    if tcp_handle and object_handle:
-        # Parent the object to the TCP
-        # This makes the object follow the TCP.
-        # Ensure the object is dynamic and respondable if physics is involved before parenting,
-        # or make it non-static and non-respondable after parenting for pure kinematic attachment.
-        # For simplicity, we'll just parent it.
-        sim.simxSetObjectParent(client_id, object_handle, tcp_handle, True, sim.simx_opmode_oneshot_wait)
-        print(f"Object attached to gripper TCP.")
+    """Anexa o objeto alvo ao TCP da garra."""
+    print(f"Anexando objeto (handle {object_handle}) ao TCP (handle {tcp_handle}).")
+    # Define o TCP como pai do objeto, mantendo a transformação atual do objeto.
+    err_code = sim.simxSetObjectParent(client_id, object_handle, tcp_handle, True, sim.simx_opmode_oneshot_wait)
+    if err_code == sim.simx_return_ok or err_code == sim.simx_return_novalue_flag:
+        print("Objeto anexado com sucesso.")
     else:
-        print("Could not attach object: TCP or object handle missing.")
+        print(f"Erro ao anexar objeto: {err_code}")
 
-def detach_object_from_gripper(client_id, object_handle, scene_object_handle=-1):
-    """Detaches the object from the gripper, making it child of the scene."""
-    if object_handle:
-        # Parent the object to the world (or a specific base plate)
-        sim.simxSetObjectParent(client_id, object_handle, scene_object_handle, True, sim.simx_opmode_oneshot_wait)
-        print(f"Object detached from gripper.")
+
+def detach_object_from_gripper(client_id, object_handle, scene_root_handle=-1): # -1 para a raiz da cena (mundo)
+    """Desanexa o objeto da garra, tornando-o filho da raiz da cena."""
+    print(f"Desanexando objeto (handle {object_handle}).")
+    # Define a raiz da cena como pai, mantendo a transformação atual.
+    err_code = sim.simxSetObjectParent(client_id, object_handle, scene_root_handle, True, sim.simx_opmode_oneshot_wait)
+    if err_code == sim.simx_return_ok or err_code == sim.simx_return_novalue_flag:
+        print("Objeto desanexado com sucesso.")
     else:
-        print("Could not detach object: object handle missing.")
+        print(f"Erro ao desanexar objeto: {err_code}")
 
 # --- Main Pick and Place Logic ---
 def perform_pick_and_place(client_id, handles):
-    """Executes the full pick and place sequence."""
+    """Executa a sequência completa de pegar e soltar."""
+    print("\n--- Iniciando Sequência de Pegar e Soltar ---")
 
-    # 0. Ensure gripper is open and robot is at rest
-    print("Initializing: Moving to REST and opening gripper.")
+    # 0. Garantir que a garra está aberta inicialmente
     control_gripper(client_id, handles['gripper_joint'], "open", GRIPPER_OPEN_POS_DEG, GRIPPER_CLOSED_POS_DEG)
-    set_joint_target_positions(client_id, handles['joints'], Q_REST)
-    
-    # 1. Ir para frente e agarrar objeto (Ponto B)
-    print("\nStep 1: Moving to pick object...")
-    set_joint_target_positions(client_id, handles['joints'], Q_APPROACH_PICK)
-    set_joint_target_positions(client_id, handles['joints'], Q_GRASP_OBJECT)
-    control_gripper(client_id, handles['gripper_joint'], "close", GRIPPER_OPEN_POS_DEG, GRIPPER_CLOSED_POS_DEG)
-    attach_object_to_gripper(client_id, handles['tcp'], handles['target_object']) # Attach object
-    time.sleep(0.5) # Ensure grasp
 
-    # 2. Voltar para trás (Ponto C)
-    print("\nStep 2: Retreating with object...")
-    set_joint_target_positions(client_id, handles['joints'], Q_RETREAT_BACK) # Could be Q_APPROACH_PICK
+    # 1. Mover para Posição de Repouso (Ponto A)
+    print("\nPasso 1: Movendo para posição de repouso (Q_REST).")
+    set_joint_target_positions(client_id, handles['joints'], Q_REST, wait_time=3)
+    time.sleep(1)
 
-    # 3. Rotacionar base à direita (Ponto D)
-    print("\nStep 3: Rotating base...")
-    # Here, Q_ROTATE_BASE already has q1 modified.
-    # If you wanted to calculate this dynamically based on current q2-q6,
-    # you would read current joints, modify q1, then set.
-    set_joint_target_positions(client_id, handles['joints'], Q_ROTATE_BASE)
-
-    # 4. Avançar com o objeto (Ponto E)
-    print("\nStep 4: Moving to release object...")
-    set_joint_target_positions(client_id, handles['joints'], Q_APPROACH_RELEASE)
-    set_joint_target_positions(client_id, handles['joints'], Q_RELEASE_OBJECT)
-    
-    # 5. Soltar objeto
-    print("\nStep 5: Releasing object...")
-    control_gripper(client_id, handles['gripper_joint'], "open", GRIPPER_OPEN_POS_DEG, GRIPPER_CLOSED_POS_DEG)
-    detach_object_from_gripper(client_id, handles['target_object']) # Detach object
+    # 2. Aproximar do Local de Pegar (Ponto B - Aproximação)
+    print("\nPasso 2: Aproximando do local de pegar (Q_APPROACH_PICK).")
+    set_joint_target_positions(client_id, handles['joints'], Q_APPROACH_PICK, wait_time=3)
     time.sleep(0.5)
 
-    # 6. Return to a safe/retreat position after release, then to rest
-    print("\nStep 6: Returning to rest...")
-    set_joint_target_positions(client_id, handles['joints'], Q_APPROACH_RELEASE) # Retreat slightly
-    set_joint_target_positions(client_id, handles['joints'], Q_REST)
+    # 3. Mover para Posição de Agarre (Ponto B - Agarre)
+    print("\nPasso 3: Movendo para posição de agarre (Q_GRASP_OBJECT).")
+    set_joint_target_positions(client_id, handles['joints'], Q_GRASP_OBJECT, wait_time=2)
+    time.sleep(0.5)
 
-    print("\nPick and Place sequence completed!")
+    # 4. Fechar Garra (Pegar)
+    print("\nPasso 4: Fechando garra para pegar objeto.")
+    control_gripper(client_id, handles['gripper_joint'], "close", GRIPPER_OPEN_POS_DEG, GRIPPER_CLOSED_POS_DEG)
+    
+    # 5. Anexar Objeto à Garra
+    print("\nPasso 5: Anexando objeto.")
+    attach_object_to_gripper(client_id, handles['tcp'], handles['target_object'])
+    time.sleep(0.5) # Pequena pausa para estabilizar a física da anexação
+
+    # 6. Recuar Após Pegar (Ponto C)
+    print("\nPasso 6: Recuando após pegar (Q_RETREAT_AFTER_PICK).")
+    set_joint_target_positions(client_id, handles['joints'], Q_RETREAT_AFTER_PICK, wait_time=3)
+    time.sleep(1)
+
+    # 7. Aproximar do Local de Soltar (Ponto D - Aproximação)
+    print("\nPasso 7: Aproximando do local de soltar (Q_APPROACH_RELEASE).")
+    set_joint_target_positions(client_id, handles['joints'], Q_APPROACH_RELEASE, wait_time=3)
+    time.sleep(0.5)
+
+    # 8. Mover para Posição de Soltar (Ponto D - Soltar)
+    print("\nPasso 8: Movendo para posição de soltar (Q_RELEASE_OBJECT).")
+    set_joint_target_positions(client_id, handles['joints'], Q_RELEASE_OBJECT, wait_time=2)
+    time.sleep(0.5)
+
+    # 9. Abrir Garra (Soltar)
+    print("\nPasso 9: Abrindo garra para soltar objeto.")
+    control_gripper(client_id, handles['gripper_joint'], "open", GRIPPER_OPEN_POS_DEG, GRIPPER_CLOSED_POS_DEG)
+
+    # 10. Desanexar Objeto da Garra
+    print("\nPasso 10: Desanexando objeto.")
+    detach_object_from_gripper(client_id, handles['target_object']) # Desanexa para o mundo
+    time.sleep(0.5)
+
+    # 11. Recuar após soltar / Mover para uma posição pós-soltar (Ponto E)
+    print("\nPasso 11: Recuando após soltar (Q_POST_RELEASE_RETREAT).")
+    set_joint_target_positions(client_id, handles['joints'], Q_POST_RELEASE_RETREAT, wait_time=3)
+    time.sleep(1)
+
+    # 12. Opcional: mover de volta para Repouso
+    print("\nPasso 12: Movendo de volta para posição de repouso (Q_REST).")
+    set_joint_target_positions(client_id, handles['joints'], Q_REST, wait_time=3)
+
+    print("\n--- Sequência de Pegar e Soltar Completa ---")
 
 # --- Script Execution ---
 if __name__ == "__main__":
     client_id = connect_to_coppeliasim()
-    
     if client_id != -1:
-        # Start simulation if not already running
-        # sim.simxStartSimulation(client_id, sim.simx_opmode_oneshot)
-        
-        # Get handles
-        object_handles = get_object_handles(client_id)
+        try:
+            # Iniciar simulação (importante se ainda não estiver rodando e você precisa de física/dinâmica)
+            res = sim.simxStartSimulation(client_id, sim.simx_opmode_oneshot_wait)
+            # res pode ser sim.simx_return_ok ou sim.simx_return_novalue_flag se já estiver rodando
+            if res == sim.simx_return_ok or res == sim.simx_return_novalue_flag or res == 8: # 8 = simx_return_initialize_error_flag (mas pode significar que já está rodando)
+                print("Simulação iniciada ou já estava rodando.")
+            else:
+                print(f"Falha ao iniciar simulação: {res}. Pode já estar rodando.")
+            
+            time.sleep(1) # Dar um momento para a simulação estabilizar após iniciar
 
-        if object_handles and all(object_handles['joints']):
-            # Initialize streaming for joint positions for the wait logic
-            for handle in object_handles['joints']:
-                 sim.simxGetJointPosition(client_id, handle, sim.simx_opmode_streaming)
-            time.sleep(0.1) # Allow streaming to start
+            handles = get_object_handles(client_id)
+            if handles:
+                # Opcional: Obter posição inicial do objeto alvo para confirmação
+                err_code, obj_pos = sim.simxGetObjectPosition(client_id, handles['target_object'], -1, sim.simx_opmode_blocking)
+                if err_code == sim.simx_return_ok:
+                    print(f"Posição inicial do objeto alvo '{TARGET_OBJECT_NAME}': {obj_pos}")
+                
+                input("Pressione Enter para iniciar a sequência de pegar e soltar...")
+                perform_pick_and_place(client_id, handles)
+            else:
+                print("Não foi possível obter todos os handles necessários. Saindo.")
 
-            # Perform the task
-            try:
-                input("Press Enter to start the Pick and Place sequence...")
-                sim.simxStartSimulation(client_id, sim.simx_opmode_oneshot_wait) # Ensure simulation is running
-                perform_pick_and_place(client_id, object_handles)
-            except Exception as e:
-                print(f"An error occurred: {e}")
-            finally:
-                # Stop simulation and disconnect
-                sim.simxStopSimulation(client_id, sim.simx_opmode_oneshot_wait)
-                sim.simxFinish(client_id)
-                print("Disconnected from CoppeliaSim.")
-        else:
-            print("Could not obtain all necessary object handles. Exiting.")
+        except Exception as e:
+            print(f"Ocorreu um erro: {e}")
+        finally:
+            # Parar simulação (opcional, pode querer deixar rodando)
+            # sim.simxStopSimulation(client_id, sim.simx_opmode_oneshot_wait)
+            # print("Simulação parada.")
+            # Fechar a conexão com o CoppeliaSim
             sim.simxFinish(client_id)
+            print("Conexão com CoppeliaSim fechada.")
+    else:
+        print("Não foi possível conectar ao CoppeliaSim.")
